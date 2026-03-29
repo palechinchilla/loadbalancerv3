@@ -1,0 +1,24 @@
+runpod_worker_comfy:
+  base_path: /runpod-volume
+  checkpoints: models/checkpoints/
+  clip: |
+    models/clip/
+    /runpod-volume/huggingface-cache/hub/models--comfy-org--z_image_turbo/snapshots/2f862278568d3f0a83167a16e5f11094da6dee72/
+  clip_vision: models/clip_vision/
+  configs: models/configs/
+  controlnet: models/controlnet/
+  diffusion_models: |
+    models/diffusion_models/
+    /runpod-volume/huggingface-cache/hub/models--comfy-org--z_image_turbo/snapshots/2f862278568d3f0a83167a16e5f11094da6dee72/
+  embeddings: models/embeddings/
+  loras: models/loras/
+  upscale_models: models/upscale_models/
+  vae: |
+    models/vae/
+    /runpod-volume/huggingface-cache/hub/models--comfy-org--z_image_turbo/snapshots/2f862278568d3f0a83167a16e5f11094da6dee72/
+  unet: |
+    models/unet/
+    /runpod-volume/huggingface-cache/hub/models--comfy-org--z_image_turbo/snapshots/2f862278568d3f0a83167a16e5f11094da6dee72/
+  text_encoders: |
+    models/text_encoders/
+    /runpod-volume/huggingface-cache/hub/models--comfy-org--z_image_turbo/snapshots/2f862278568d3f0a83167a16e5f11094da6dee72/
