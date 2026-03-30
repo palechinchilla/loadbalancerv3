@@ -658,14 +658,14 @@ def _build_prewarm_workflow():
         },
         "62": {
             "inputs": {
-                "clip_name": "qwen_3_4b.safetensors",
+                "clip_name": "split_files/text_encoders/qwen_3_4b.safetensors",
                 "type": "lumina2",
                 "device": "default",
             },
             "class_type": "CLIPLoader",
         },
         "63": {
-            "inputs": {"vae_name": "ae.safetensors"},
+            "inputs": {"vae_name": "split_files/vae/ae.safetensors"},
             "class_type": "VAELoader",
         },
         "64": {
@@ -705,7 +705,7 @@ def _build_prewarm_workflow():
         },
         "74": {
             "inputs": {
-                "model_name": "z_image_turbo_bf16.safetensors",
+                "model_name": "split_files/diffusion_models/z_image_turbo_bf16.safetensors",
                 "weight_dtype": "bf16",
                 "compute_dtype": "fp16",
                 "patch_cublaslinear": True,
