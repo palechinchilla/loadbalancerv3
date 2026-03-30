@@ -23,6 +23,16 @@ TCMALLOC="$(ldconfig -p | grep -Po "libtcmalloc.so.\d" | head -n 1)"
 export LD_PRELOAD="${TCMALLOC}"
 
 # ---------------------------------------------------------------------------
+# Performance: maximize available RAM/VRAM and speed up CUDA initialization
+# ---------------------------------------------------------------------------
+# Lazy-load CUDA modules — only load kernels when first needed, cuts startup time
+export CUDA_MODULE_LOADING=LAZY
+# Better VRAM fragmentation handling — expandable segments avoid OOM from fragmentation
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.9"
+# Disable Python bytecode caching (avoids stale .pyc I/O on network volumes)
+export PYTHONDONTWRITEBYTECODE=1
+
+# ---------------------------------------------------------------------------
 # GPU pre-flight check
 # ---------------------------------------------------------------------------
 echo "worker-comfyui: Checking GPU availability..."
@@ -44,7 +54,7 @@ echo "worker-comfyui: Starting ComfyUI"
 COMFY_PID_FILE="/tmp/comfyui.pid"
 
 # Start ComfyUI in background
-python -u /comfyui/main.py --disable-auto-launch --disable-metadata --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
+python -u /comfyui/main.py --disable-auto-launch --disable-metadata --gpu-only --fast --verbose "${COMFY_LOG_LEVEL}" --log-stdout &
 echo $! > "$COMFY_PID_FILE"
 
 echo "worker-comfyui: Starting FastAPI server"
