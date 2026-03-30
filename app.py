@@ -1,40 +1,30 @@
-"""
-FastAPI load-balancing worker for ComfyUI on RunPod.
-
-Replaces the queue-based handler.py.  Exposes:
-  GET  /ping      – health check (204 while booting, 200 when ready)
-  POST /generate  – submit a ComfyUI workflow and receive output images
-"""
-
+import asyncio
 import base64
 import binascii
 import json
-import os
-import uuid
-import traceback
 import logging
-import asyncio
+import os
 import time
+import uuid
 from contextlib import asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
+import websockets
+from fastapi import FastAPI
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel
+
 try:
     import orjson
 except ImportError:  # pragma: no cover - runtime image installs orjson
     orjson = None
-import websockets
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel
 
 
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class _SuppressPingAccessFilter(logging.Filter):
@@ -44,74 +34,60 @@ class _SuppressPingAccessFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_SuppressPingAccessFilter())
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
-# Time to wait between API check attempts in milliseconds
-COMFY_API_AVAILABLE_INTERVAL_MS = int(
-    os.environ.get("COMFY_API_AVAILABLE_INTERVAL_MS", 50)
-)
-# Maximum number of API check attempts (0 = no limit, poll while process alive)
-COMFY_API_AVAILABLE_MAX_RETRIES = int(
-    os.environ.get("COMFY_API_AVAILABLE_MAX_RETRIES", 0)
-)
-# Fallback retry limit when PID file is unavailable and retries=0
-COMFY_API_FALLBACK_MAX_RETRIES = 500
-# PID file written by start.sh so we can detect if ComfyUI has crashed
-COMFY_PID_FILE = "/tmp/comfyui.pid"
+def _env_int(name: str, default: int) -> int:
+    return int(os.environ.get(name, default))
 
-# WebSocket reconnection behaviour
-WEBSOCKET_RECONNECT_ATTEMPTS = int(os.environ.get("WEBSOCKET_RECONNECT_ATTEMPTS", 5))
-WEBSOCKET_RECONNECT_DELAY_S = int(os.environ.get("WEBSOCKET_RECONNECT_DELAY_S", 3))
 
-# Host where ComfyUI is running
-COMFY_HOST = "127.0.0.1:8188"
-COMFY_BASE_URL = f"http://{COMFY_HOST}"
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, default))
 
-# Per-request processing timeout (RunPod allows 5.5 min max)
-PROCESSING_TIMEOUT_S = int(os.environ.get("PROCESSING_TIMEOUT_S", 300))
 
-# Port for the FastAPI server
-PORT = int(os.environ.get("PORT", 80))
+@dataclass(frozen=True)
+class Settings:
+    comfy_host: str = os.environ.get("COMFY_HOST", "127.0.0.1:8188")
+    comfy_pid_file: str = os.environ.get("COMFY_PID_FILE", "/tmp/comfyui.pid")
+    processing_timeout_s: int = _env_int("PROCESSING_TIMEOUT_S", 300)
+    port: int = _env_int("PORT", 80)
+    api_interval_ms: int = _env_int("COMFY_API_AVAILABLE_INTERVAL_MS", 50)
+    api_max_retries: int = _env_int("COMFY_API_AVAILABLE_MAX_RETRIES", 0)
+    api_fallback_max_retries: int = 500
+    ws_reconnect_attempts: int = _env_int("WEBSOCKET_RECONNECT_ATTEMPTS", 5)
+    ws_reconnect_delay_s: int = _env_int("WEBSOCKET_RECONNECT_DELAY_S", 3)
+    connect_timeout_s: float = _env_float("COMFY_HTTP_CONNECT_TIMEOUT_S", 2.0)
+    read_timeout_s: float = _env_float("COMFY_HTTP_READ_TIMEOUT_S", 30.0)
+    write_timeout_s: float = _env_float("COMFY_HTTP_WRITE_TIMEOUT_S", 10.0)
+    pool_timeout_s: float = _env_float("COMFY_HTTP_POOL_TIMEOUT_S", 5.0)
+    max_connections: int = max(1, _env_int("COMFY_HTTP_MAX_CONNECTIONS", 64))
+    max_keepalive_connections: int = max(
+        1, _env_int("COMFY_HTTP_MAX_KEEPALIVE_CONNECTIONS", 32)
+    )
+    keepalive_expiry_s: float = _env_float("COMFY_HTTP_KEEPALIVE_EXPIRY_S", 30.0)
+    status_read_timeout_s: float = _env_float("COMFY_HTTP_STATUS_READ_TIMEOUT_S", 5.0)
+    prompt_read_timeout_s: float = _env_float("COMFY_HTTP_PROMPT_READ_TIMEOUT_S", 30.0)
+    prompt_write_timeout_s: float = _env_float(
+        "COMFY_HTTP_PROMPT_WRITE_TIMEOUT_S", 30.0
+    )
+    history_read_timeout_s: float = _env_float(
+        "COMFY_HTTP_HISTORY_READ_TIMEOUT_S", 15.0
+    )
+    output_read_timeout_s: float = _env_float("COMFY_HTTP_OUTPUT_READ_TIMEOUT_S", 30.0)
+    upload_read_timeout_s: float = _env_float("COMFY_HTTP_UPLOAD_READ_TIMEOUT_S", 30.0)
+    upload_write_timeout_s: float = _env_float(
+        "COMFY_HTTP_UPLOAD_WRITE_TIMEOUT_S", 30.0
+    )
+    output_fetch_concurrency: int = max(1, _env_int("COMFY_OUTPUT_FETCH_CONCURRENCY", 8))
 
-# Shared HTTP client tuning for low-latency local ComfyUI traffic
-COMFY_HTTP_CONNECT_TIMEOUT_S = float(os.environ.get("COMFY_HTTP_CONNECT_TIMEOUT_S", 2.0))
-COMFY_HTTP_READ_TIMEOUT_S = float(os.environ.get("COMFY_HTTP_READ_TIMEOUT_S", 30.0))
-COMFY_HTTP_WRITE_TIMEOUT_S = float(os.environ.get("COMFY_HTTP_WRITE_TIMEOUT_S", 10.0))
-COMFY_HTTP_POOL_TIMEOUT_S = float(os.environ.get("COMFY_HTTP_POOL_TIMEOUT_S", 5.0))
-COMFY_HTTP_MAX_CONNECTIONS = max(1, int(os.environ.get("COMFY_HTTP_MAX_CONNECTIONS", 64)))
-COMFY_HTTP_MAX_KEEPALIVE_CONNECTIONS = max(
-    1, int(os.environ.get("COMFY_HTTP_MAX_KEEPALIVE_CONNECTIONS", 32))
-)
-COMFY_HTTP_KEEPALIVE_EXPIRY_S = float(
-    os.environ.get("COMFY_HTTP_KEEPALIVE_EXPIRY_S", 30.0)
-)
-COMFY_OUTPUT_FETCH_CONCURRENCY = max(
-    1, int(os.environ.get("COMFY_OUTPUT_FETCH_CONCURRENCY", 8))
-)
-COMFY_HTTP_STATUS_READ_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_STATUS_READ_TIMEOUT_S", 5.0)
-)
-COMFY_HTTP_PROMPT_READ_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_PROMPT_READ_TIMEOUT_S", 30.0)
-)
-COMFY_HTTP_PROMPT_WRITE_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_PROMPT_WRITE_TIMEOUT_S", 30.0)
-)
-COMFY_HTTP_HISTORY_READ_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_HISTORY_READ_TIMEOUT_S", 15.0)
-)
-COMFY_HTTP_OUTPUT_READ_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_OUTPUT_READ_TIMEOUT_S", 30.0)
-)
-COMFY_HTTP_UPLOAD_READ_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_UPLOAD_READ_TIMEOUT_S", 30.0)
-)
-COMFY_HTTP_UPLOAD_WRITE_TIMEOUT_S = float(
-    os.environ.get("COMFY_HTTP_UPLOAD_WRITE_TIMEOUT_S", 30.0)
-)
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.comfy_host}"
 
+    @property
+    def ws_url(self) -> str:
+        return f"ws://{self.comfy_host}/ws"
+
+
+SETTINGS = Settings()
 LATENCY_STAGES = (
     "receive",
     "upload",
@@ -123,6 +99,24 @@ LATENCY_STAGES = (
     "response_serialize",
     "total",
 )
+POSTPROCESS_STAGES = (
+    "output_manifest",
+    "image_fetch",
+    "base64_encode",
+    "response_serialize",
+)
+ImageManifest = dict[str, dict[str, Any]]
+
+
+class ImageInput(BaseModel):
+    name: str
+    image: str
+
+
+class GenerateRequest(BaseModel):
+    workflow: dict[str, Any]
+    images: list[ImageInput] | None = None
+    comfy_org_api_key: str | None = None
 
 
 @dataclass
@@ -137,157 +131,101 @@ class RequestTrace:
 
     @contextmanager
     def measure(self, stage: str):
-        start_ns = time.perf_counter_ns()
+        started_ns = time.perf_counter_ns()
         try:
             yield
         finally:
-            self.stage_ns[stage] += time.perf_counter_ns() - start_ns
+            self.stage_ns[stage] += time.perf_counter_ns() - started_ns
 
     def add_ns(self, stage: str, duration_ns: int) -> None:
         self.stage_ns[stage] += max(0, duration_ns)
 
-    def mark_total(self) -> None:
+    def finish(self) -> None:
         self.stage_ns["total"] = time.perf_counter_ns() - self.started_ns
+
+    def headers(self) -> dict[str, str]:
+        postprocess_ns = sum(self.stage_ns[stage] for stage in POSTPROCESS_STAGES)
+        return {
+            "X-Worker-Request-Id": self.request_id,
+            "X-Worker-Total-Ms": f"{_ns_to_ms(self.stage_ns['total']):.3f}",
+            "X-Worker-Queue-Ms": f"{_ns_to_ms(self.stage_ns['queue']):.3f}",
+            "X-Worker-Execute-Ms": f"{_ns_to_ms(self.stage_ns['websocket_wait']):.3f}",
+            "X-Worker-Postprocess-Ms": f"{_ns_to_ms(postprocess_ns):.3f}",
+            "X-Worker-Response-Bytes": str(self.response_bytes),
+        }
+
+    def summary(self, status_code: int, error: str | None = None) -> dict[str, Any]:
+        payload = {
+            "request_id": self.request_id,
+            "status_code": status_code,
+            "output_source": self.output_source,
+            "response_bytes": self.response_bytes,
+            "stages_ms": {
+                stage: _ns_to_ms(self.stage_ns[stage]) for stage in LATENCY_STAGES
+            },
+        }
+        if error:
+            payload["error"] = error
+        return payload
 
 
 @dataclass
-class MonitorResult:
-    execution_done: bool
-    errors: list[str]
-    outputs: dict[str, dict[str, Any]]
-
-
-# ---------------------------------------------------------------------------
-# Pydantic request / response models
-# ---------------------------------------------------------------------------
-
-class ImageInput(BaseModel):
-    name: str
-    image: str
-
-
-class GenerateRequest(BaseModel):
-    workflow: dict
-    images: list[ImageInput] | None = None
-    comfy_org_api_key: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# ComfyUI helper functions
-# ---------------------------------------------------------------------------
-
-def _http_timeout(*, read_s: float | None = None, write_s: float | None = None) -> httpx.Timeout:
-    return httpx.Timeout(
-        connect=COMFY_HTTP_CONNECT_TIMEOUT_S,
-        read=COMFY_HTTP_READ_TIMEOUT_S if read_s is None else read_s,
-        write=COMFY_HTTP_WRITE_TIMEOUT_S if write_s is None else write_s,
-        pool=COMFY_HTTP_POOL_TIMEOUT_S,
-    )
-
-
-def _build_http_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        base_url=COMFY_BASE_URL,
-        trust_env=False,
-        http2=False,
-        follow_redirects=False,
-        limits=httpx.Limits(
-            max_connections=COMFY_HTTP_MAX_CONNECTIONS,
-            max_keepalive_connections=COMFY_HTTP_MAX_KEEPALIVE_CONNECTIONS,
-            keepalive_expiry=COMFY_HTTP_KEEPALIVE_EXPIRY_S,
-        ),
-        timeout=_http_timeout(),
-    )
+class ExecutionResult:
+    done: bool
+    errors: list[str] = field(default_factory=list)
+    outputs: ImageManifest = field(default_factory=dict)
 
 
 def _ns_to_ms(duration_ns: int) -> float:
     return round(duration_ns / 1_000_000, 3)
 
 
-def _serialize_json_bytes(payload: dict[str, Any]) -> bytes:
+def _json_dumps(payload: Any) -> bytes:
     if orjson is not None:
         return orjson.dumps(payload)
-    return json.dumps(
-        payload, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-def _load_json_bytes(payload: bytes) -> Any:
+def _json_loads(payload: str | bytes) -> Any:
     if orjson is not None:
         return orjson.loads(payload)
     return json.loads(payload)
 
 
-def _load_response_json(response: httpx.Response) -> Any:
-    return _load_json_bytes(response.content)
-
-
-def _trace_headers(trace: RequestTrace) -> dict[str, str]:
-    postprocess_ns = max(
-        trace.stage_ns["total"]
-        - trace.stage_ns["receive"]
-        - trace.stage_ns["upload"]
-        - trace.stage_ns["queue"]
-        - trace.stage_ns["websocket_wait"],
-        0,
-    )
-    return {
-        "X-Worker-Request-Id": trace.request_id,
-        "X-Worker-Total-Ms": f"{_ns_to_ms(trace.stage_ns['total']):.3f}",
-        "X-Worker-Queue-Ms": f"{_ns_to_ms(trace.stage_ns['queue']):.3f}",
-        "X-Worker-Execute-Ms": f"{_ns_to_ms(trace.stage_ns['websocket_wait']):.3f}",
-        "X-Worker-Postprocess-Ms": f"{_ns_to_ms(postprocess_ns):.3f}",
-        "X-Worker-Response-Bytes": str(trace.response_bytes),
-    }
-
-
-def _log_request_summary(
-    trace: RequestTrace, status_code: int, error: str | None = None
-) -> None:
-    summary = {
-        "request_id": trace.request_id,
-        "status_code": status_code,
-        "output_source": trace.output_source,
-        "response_bytes": trace.response_bytes,
-        "stages_ms": {
-            stage: _ns_to_ms(trace.stage_ns[stage]) for stage in LATENCY_STAGES
-        },
-    }
-    if error:
-        summary["error"] = error
-    logger.info("worker-comfyui latency %s", json.dumps(summary, separators=(",", ":")))
-
-
-async def _comfy_server_status(http_client: httpx.AsyncClient) -> dict[str, Any]:
-    """Return a dictionary with basic reachability info for the ComfyUI HTTP server."""
-    try:
-        resp = await http_client.get(
-            "/", timeout=_http_timeout(read_s=COMFY_HTTP_STATUS_READ_TIMEOUT_S)
+def _response_json(
+    payload: dict[str, Any],
+    status_code: int,
+    trace: RequestTrace | None = None,
+    *,
+    error: str | None = None,
+) -> Response:
+    if trace is None:
+        return Response(
+            content=_json_dumps(payload),
+            media_type="application/json",
+            status_code=status_code,
         )
-        return {
-            "reachable": resp.status_code == 200,
-            "status_code": resp.status_code,
-        }
-    except httpx.RequestError as exc:
-        return {"reachable": False, "error": str(exc)}
+    with trace.measure("response_serialize"):
+        body = _json_dumps(payload)
+    trace.response_bytes = len(body)
+    trace.finish()
+    logger.info(
+        "worker-comfyui latency %s",
+        _json_dumps(trace.summary(status_code, error)).decode("utf-8", errors="replace"),
+    )
+    return Response(
+        content=body,
+        media_type="application/json",
+        status_code=status_code,
+        headers=trace.headers(),
+    )
 
 
-def _get_comfyui_pid():
-    """Read the ComfyUI process PID from the PID file written by start.sh."""
+def _pid_is_alive(pid_file: str) -> bool | None:
     try:
-        with open(COMFY_PID_FILE, "r") as f:
-            return int(f.read().strip())
+        with open(pid_file, "r") as handle:
+            pid = int(handle.read().strip())
     except (FileNotFoundError, ValueError):
-        return None
-
-
-def _is_comfyui_process_alive():
-    """Check whether the ComfyUI process is still running.
-
-    Returns True if alive, False if dead, None if PID file not found.
-    """
-    pid = _get_comfyui_pid()
-    if pid is None:
         return None
     try:
         os.kill(pid, 0)
@@ -295,812 +233,604 @@ def _is_comfyui_process_alive():
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True  # process exists but we can't signal it
+        return True
 
 
-
-async def upload_images(http_client: httpx.AsyncClient, images: list[dict[str, str]]) -> dict[str, Any]:
-    """
-    Upload a list of base64 encoded images to the ComfyUI server using the /upload/image endpoint.
-    """
-    if not images:
-        return {"status": "success", "message": "No images to upload", "details": []}
-
-    responses = []
-    upload_errors = []
-
-    print(f"worker-comfyui - Uploading {len(images)} image(s)...")
-
-    for image in images:
-        try:
-            name = image["name"]
-            image_data_uri = image["image"]
-
-            if "," in image_data_uri:
-                base64_data = image_data_uri.split(",", 1)[1]
-            else:
-                base64_data = image_data_uri
-
-            blob = base64.b64decode(base64_data.strip(), validate=True)
-
-            files = {
-                "image": (name, blob, "image/png"),
-                "overwrite": (None, "true"),
-            }
-
-            response = await http_client.post(
-                "/upload/image",
-                files=files,
-                timeout=_http_timeout(
-                    read_s=COMFY_HTTP_UPLOAD_READ_TIMEOUT_S,
-                    write_s=COMFY_HTTP_UPLOAD_WRITE_TIMEOUT_S,
-                ),
-            )
-            response.raise_for_status()
-
-            responses.append(f"Successfully uploaded {name}")
-            print(f"worker-comfyui - Successfully uploaded {name}")
-
-        except (binascii.Error, ValueError) as e:
-            error_msg = f"Error decoding base64 for {image.get('name', 'unknown')}: {e}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
-        except httpx.TimeoutException:
-            error_msg = f"Timeout uploading {image.get('name', 'unknown')}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
-        except httpx.RequestError as e:
-            error_msg = f"Error uploading {image.get('name', 'unknown')}: {e}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
-        except Exception as e:
-            error_msg = (
-                f"Unexpected error uploading {image.get('name', 'unknown')}: {e}"
-            )
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
-
-    if upload_errors:
-        print(f"worker-comfyui - image(s) upload finished with errors")
-        return {
-            "status": "error",
-            "message": "Some images failed to upload",
-            "details": upload_errors,
-        }
-
-    print(f"worker-comfyui - image(s) upload complete")
-    return {
-        "status": "success",
-        "message": "All images uploaded successfully",
-        "details": responses,
-    }
-
-
-async def get_available_models(http_client: httpx.AsyncClient) -> dict[str, Any]:
-    """Get list of available models from ComfyUI."""
-    try:
-        response = await http_client.get("/object_info", timeout=_http_timeout(read_s=10.0))
-        response.raise_for_status()
-        object_info = _load_response_json(response)
-
-        available_models = {}
-        if "CheckpointLoaderSimple" in object_info:
-            checkpoint_info = object_info["CheckpointLoaderSimple"]
-            if "input" in checkpoint_info and "required" in checkpoint_info["input"]:
-                ckpt_options = checkpoint_info["input"]["required"].get("ckpt_name")
-                if ckpt_options and len(ckpt_options) > 0:
-                    available_models["checkpoints"] = (
-                        ckpt_options[0] if isinstance(ckpt_options[0], list) else []
-                    )
-
-        return available_models
-    except Exception as e:
-        print(f"worker-comfyui - Warning: Could not fetch available models: {e}")
-        return {}
-
-
-async def queue_workflow(
-    http_client: httpx.AsyncClient,
-    workflow: dict[str, Any],
-    client_id: str,
-    comfy_org_api_key: str | None = None,
-) -> dict[str, Any]:
-    """
-    Queue a workflow to be processed by ComfyUI.
-
-    Raises:
-        ValueError: If the workflow validation fails with detailed error information.
-    """
-    payload = {"prompt": workflow, "client_id": client_id}
-
-    key_from_env = os.environ.get("COMFY_ORG_API_KEY")
-    effective_key = comfy_org_api_key if comfy_org_api_key else key_from_env
-    if effective_key:
-        payload["extra_data"] = {"api_key_comfy_org": effective_key}
-
-    response = await http_client.post(
-        "/prompt",
-        content=_serialize_json_bytes(payload),
-        headers={"Content-Type": "application/json"},
-        timeout=_http_timeout(
-            read_s=COMFY_HTTP_PROMPT_READ_TIMEOUT_S,
-            write_s=COMFY_HTTP_PROMPT_WRITE_TIMEOUT_S,
-        ),
-    )
-
-    if response.status_code == 400:
-        print(f"worker-comfyui - ComfyUI returned 400. Response body: {response.text}")
-        try:
-            error_data = _load_response_json(response)
-            print(f"worker-comfyui - Parsed error data: {error_data}")
-
-            error_message = "Workflow validation failed"
-            error_details = []
-
-            if "error" in error_data:
-                error_info = error_data["error"]
-                if isinstance(error_info, dict):
-                    error_message = error_info.get("message", error_message)
-                    if error_info.get("type") == "prompt_outputs_failed_validation":
-                        error_message = "Workflow validation failed"
-                else:
-                    error_message = str(error_info)
-
-            if "node_errors" in error_data:
-                for node_id, node_error in error_data["node_errors"].items():
-                    if isinstance(node_error, dict):
-                        for error_type, error_msg in node_error.items():
-                            error_details.append(
-                                f"Node {node_id} ({error_type}): {error_msg}"
-                            )
-                    else:
-                        error_details.append(f"Node {node_id}: {node_error}")
-
-            if error_data.get("type") == "prompt_outputs_failed_validation":
-                error_message = error_data.get("message", "Workflow validation failed")
-                available_models = await get_available_models(http_client)
-                if available_models.get("checkpoints"):
-                    error_message += f"\n\nThis usually means a required model or parameter is not available."
-                    error_message += f"\nAvailable checkpoint models: {', '.join(available_models['checkpoints'])}"
-                else:
-                    error_message += "\n\nThis usually means a required model or parameter is not available."
-                    error_message += "\nNo checkpoint models appear to be available. Please check your model installation."
-                raise ValueError(error_message)
-
-            if error_details:
-                detailed_message = f"{error_message}:\n" + "\n".join(
-                    f"• {detail}" for detail in error_details
-                )
-
-                if any(
-                    "not in list" in detail and "ckpt_name" in detail
-                    for detail in error_details
-                ):
-                    available_models = await get_available_models(http_client)
-                    if available_models.get("checkpoints"):
-                        detailed_message += f"\n\nAvailable checkpoint models: {', '.join(available_models['checkpoints'])}"
-                    else:
-                        detailed_message += "\n\nNo checkpoint models appear to be available. Please check your model installation."
-
-                raise ValueError(detailed_message)
-            else:
-                raise ValueError(f"{error_message}. Raw response: {response.text}")
-
-        except (json.JSONDecodeError, KeyError):
-            raise ValueError(
-                f"ComfyUI validation failed (could not parse error response): {response.text}"
-            )
-
-    response.raise_for_status()
-    return _load_response_json(response)
-
-
-async def get_history(http_client: httpx.AsyncClient, prompt_id: str) -> dict[str, Any]:
-    """Retrieve the history of a given prompt using its ID."""
-    response = await http_client.get(
-        f"/history/{prompt_id}",
-        timeout=_http_timeout(read_s=COMFY_HTTP_HISTORY_READ_TIMEOUT_S),
-    )
-    response.raise_for_status()
-    return _load_response_json(response)
-
-
-async def get_image_data(
-    http_client: httpx.AsyncClient,
-    filename: str,
-    subfolder: str,
-    image_type: str | None,
-) -> bytes | None:
-    """Fetch image bytes from the ComfyUI /view endpoint."""
-    data = {"filename": filename, "subfolder": subfolder, "type": image_type}
-    try:
-        response = await http_client.get(
-            "/view",
-            params=data,
-            timeout=_http_timeout(read_s=COMFY_HTTP_OUTPUT_READ_TIMEOUT_S),
-        )
-        response.raise_for_status()
-        return response.content
-    except httpx.TimeoutException:
-        print(f"worker-comfyui - Timeout fetching image data for {filename}")
-        return None
-    except httpx.RequestError as e:
-        print(f"worker-comfyui - Error fetching image data for {filename}: {e}")
-        return None
-    except Exception as e:
-        print(
-            f"worker-comfyui - Unexpected error fetching image data for {filename}: {e}"
-        )
-        return None
-
-
-def _record_ws_output(
-    outputs: dict[str, dict[str, Any]], prompt_id: str, data: dict[str, Any]
-) -> None:
-    if data.get("prompt_id") != prompt_id:
+def _record_ws_output(outputs: ImageManifest, prompt_id: str, data: dict[str, Any]) -> None:
+    if data.get("prompt_id") != prompt_id or not isinstance(data.get("output"), dict):
         return
-
     node_id = data.get("node")
-    node_output = data.get("output")
-    if node_id is None or not isinstance(node_output, dict):
+    if node_id is None:
         return
-
-    normalized_node_id = str(node_id)
-    existing = outputs.get(normalized_node_id, {}).copy()
-    if "images" in node_output:
-        existing["images"] = node_output["images"]
-    for key, value in node_output.items():
-        if key != "images":
-            existing[key] = value
-    outputs[normalized_node_id] = existing
+    existing = outputs.get(str(node_id), {}).copy()
+    output = data["output"]
+    if "images" in output:
+        existing["images"] = output["images"]
+    existing.update({k: v for k, v in output.items() if k != "images"})
+    outputs[str(node_id)] = existing
 
 
-def _manifest_has_usable_images(outputs: dict[str, dict[str, Any]]) -> bool:
-    for node_output in outputs.values():
-        for image_info in node_output.get("images", []):
-            if image_info.get("filename") and image_info.get("type") != "temp":
-                return True
-    return False
+def _manifest_has_images(outputs: ImageManifest) -> bool:
+    return any(
+        image.get("filename") and image.get("type") != "temp"
+        for node in outputs.values()
+        for image in node.get("images", [])
+    )
 
 
-def _manifest_is_incomplete(outputs: dict[str, dict[str, Any]]) -> bool:
-    for node_output in outputs.values():
-        for image_info in node_output.get("images", []):
-            if image_info.get("type") == "temp":
-                continue
-            if not image_info.get("filename") or image_info.get("type") is None:
-                return True
-    return False
+def _manifest_needs_history(outputs: ImageManifest, errors: list[str]) -> bool:
+    if errors or not _manifest_has_images(outputs):
+        return True
+    return any(
+        image.get("type") != "temp"
+        and (not image.get("filename") or image.get("type") is None)
+        for node in outputs.values()
+        for image in node.get("images", [])
+    )
 
 
-def _should_fetch_history(
-    websocket_outputs: dict[str, dict[str, Any]], errors: list[str]
-) -> bool:
-    return bool(errors) or not _manifest_has_usable_images(websocket_outputs) or _manifest_is_incomplete(websocket_outputs)
-
-
-def _merge_output_manifests(
-    websocket_outputs: dict[str, dict[str, Any]],
-    history_outputs: dict[str, Any],
-) -> dict[str, dict[str, Any]]:
-    merged: dict[str, dict[str, Any]] = {}
-
-    for node_id, node_output in history_outputs.items():
-        if isinstance(node_output, dict):
-            merged[str(node_id)] = dict(node_output)
-
-    for node_id, node_output in websocket_outputs.items():
-        if not isinstance(node_output, dict):
-            continue
-        existing = merged.get(str(node_id), {}).copy()
+def _merge_outputs(primary: ImageManifest, fallback: dict[str, Any]) -> ImageManifest:
+    merged = {
+        str(node_id): dict(node_output)
+        for node_id, node_output in fallback.items()
+        if isinstance(node_output, dict)
+    }
+    for node_id, node_output in primary.items():
+        merged.setdefault(str(node_id), {}).update(
+            {k: v for k, v in node_output.items() if k != "images"}
+        )
         if "images" in node_output:
-            existing["images"] = node_output["images"]
-        for key, value in node_output.items():
-            if key != "images":
-                existing[key] = value
-        merged[str(node_id)] = existing
-
+            merged[str(node_id)]["images"] = node_output["images"]
     return merged
 
+class ComfyWorker:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.ready = False
+        self.http = httpx.AsyncClient(
+            base_url=settings.base_url,
+            trust_env=False,
+            http2=False,
+            follow_redirects=False,
+            limits=httpx.Limits(
+                max_connections=settings.max_connections,
+                max_keepalive_connections=settings.max_keepalive_connections,
+                keepalive_expiry=settings.keepalive_expiry_s,
+            ),
+            timeout=self.timeout(),
+        )
 
-def _collect_output_fetch_specs(
-    outputs: dict[str, Any], request_id: str, errors: list[str] | None = None
-) -> list[tuple[str, str, str, str | None]]:
-    specs: list[tuple[str, str, str, str | None]] = []
+    def timeout(
+        self, *, read_s: float | None = None, write_s: float | None = None
+    ) -> httpx.Timeout:
+        return httpx.Timeout(
+            connect=self.settings.connect_timeout_s,
+            read=self.settings.read_timeout_s if read_s is None else read_s,
+            write=self.settings.write_timeout_s if write_s is None else write_s,
+            pool=self.settings.pool_timeout_s,
+        )
 
-    for node_id, node_output in outputs.items():
-        if "images" in node_output:
-            for image_info in node_output["images"]:
-                filename = image_info.get("filename")
-                subfolder = image_info.get("subfolder", "")
-                img_type = image_info.get("type")
+    @staticmethod
+    def _json(response: httpx.Response) -> Any:
+        return _json_loads(response.content)
 
-                if img_type == "temp":
-                    continue
+    @staticmethod
+    def _log(message: str, *args: Any) -> None:
+        logger.info("worker-comfyui - " + message, *args)
 
-                if not filename:
-                    warn_msg = (
-                        f"Skipping image in node {node_id} due to missing filename: {image_info}"
-                    )
-                    print(f"worker-comfyui - [{request_id}] {warn_msg}")
-                    if errors is not None:
-                        errors.append(warn_msg)
-                    continue
+    @staticmethod
+    def _request_log(request_id: str, message: str, *args: Any) -> None:
+        logger.info("worker-comfyui - [%s] " + message, request_id, *args)
 
-                specs.append((node_id, filename, subfolder, img_type))
+    async def close(self) -> None:
+        await self.http.aclose()
 
-        other_keys = [k for k in node_output.keys() if k != "images"]
-        if other_keys:
-            warn_msg = f"Node {node_id} produced unhandled output keys: {other_keys}."
-            print(f"worker-comfyui - [{request_id}] WARNING: {warn_msg}")
-            print(
-                f"worker-comfyui - [{request_id}] --> If this output is useful, please consider opening an issue on GitHub to discuss adding support."
-            )
-
-    return specs
-
-
-async def _collect_output_images(
-    http_client: httpx.AsyncClient,
-    outputs: dict[str, Any],
-    request_id: str,
-    trace: RequestTrace | None = None,
-    errors: list[str] | None = None,
-) -> list[dict[str, str]]:
-    specs = _collect_output_fetch_specs(outputs, request_id, errors)
-    if not specs:
-        return []
-
-    semaphore = asyncio.Semaphore(COMFY_OUTPUT_FETCH_CONCURRENCY)
-
-    async def fetch_one(
-        spec: tuple[str, str, str, str | None]
-    ) -> tuple[dict[str, str] | None, str | None]:
-        _, filename, subfolder, img_type = spec
-        async with semaphore:
-            fetch_started_ns = time.perf_counter_ns()
-            image_bytes = await get_image_data(
-                http_client, filename, subfolder, img_type
-            )
-        if trace is not None:
-            trace.add_ns("image_fetch", time.perf_counter_ns() - fetch_started_ns)
-
-        if not image_bytes:
-            return None, f"Failed to fetch image data for {filename} from /view endpoint."
-
+    async def server_status(self) -> dict[str, Any]:
         try:
-            encode_started_ns = time.perf_counter_ns()
-            base64_image = base64.b64encode(image_bytes).decode("ascii")
-            if trace is not None:
-                trace.add_ns("base64_encode", time.perf_counter_ns() - encode_started_ns)
-            return (
-                {
-                    "filename": filename,
-                    "type": "base64",
-                    "data": base64_image,
-                },
-                None,
+            response = await self.http.get(
+                "/", timeout=self.timeout(read_s=self.settings.status_read_timeout_s)
             )
-        except Exception as e:
-            return None, f"Error encoding {filename} to base64: {e}"
+            return {
+                "reachable": response.status_code == 200,
+                "status_code": response.status_code,
+            }
+        except httpx.RequestError as exc:
+            return {"reachable": False, "error": str(exc)}
 
-    results = await asyncio.gather(*(fetch_one(spec) for spec in specs))
-    output_data: list[dict[str, str]] = []
+    async def wait_until_ready(self) -> None:
+        delay_s = max(1, self.settings.api_interval_ms) / 1000
+        log_every = max(1, int(10_000 / max(1, self.settings.api_interval_ms)))
+        url = f"{self.settings.base_url}/"
+        attempt = 0
+        self._log("Checking API server at %s...", url)
+        while True:
+            if _pid_is_alive(self.settings.comfy_pid_file) is False:
+                self._log("ComfyUI process has exited. Server will not become reachable.")
+                return
+            try:
+                response = await self.http.get(
+                    "/", timeout=self.timeout(read_s=self.settings.status_read_timeout_s)
+                )
+                if response.status_code == 200:
+                    self.ready = True
+                    self._log("API is reachable")
+                    return
+            except (httpx.TimeoutException, httpx.RequestError):
+                pass
+            attempt += 1
+            fallback = (
+                self.settings.api_max_retries
+                if self.settings.api_max_retries > 0
+                else self.settings.api_fallback_max_retries
+            )
+            if _pid_is_alive(self.settings.comfy_pid_file) is None and attempt >= fallback:
+                self._log(
+                    "Failed to connect to server at %s after %s attempts (no PID file found).",
+                    url,
+                    fallback,
+                )
+                return
+            if attempt % log_every == 0:
+                self._log(
+                    "Still waiting for API server... (%ss elapsed, attempt %s)",
+                    f"{attempt * delay_s:.0f}",
+                    attempt,
+                )
+            await asyncio.sleep(delay_s)
 
-    for image_payload, error_msg in results:
-        if image_payload is not None:
-            output_data.append(image_payload)
-        elif errors is not None and error_msg:
-            print(f"worker-comfyui - [{request_id}] {error_msg}")
-            errors.append(error_msg)
-
-    return output_data
-
-
-# ---------------------------------------------------------------------------
-# Async WebSocket monitoring
-# ---------------------------------------------------------------------------
-
-async def _monitor_execution(
-    http_client: httpx.AsyncClient, prompt_id: str, client_id: str
-) -> MonitorResult:
-    """
-    Connect to ComfyUI WebSocket and monitor workflow execution.
-
-    Returns:
-        MonitorResult with completion state, errors, and websocket output metadata.
-    """
-    ws_url = f"ws://{COMFY_HOST}/ws?clientId={client_id}"
-    errors = []
-    outputs: dict[str, dict[str, Any]] = {}
-    reconnect_count = 0
-
-    while reconnect_count <= WEBSOCKET_RECONNECT_ATTEMPTS:
+    async def _available_checkpoints(self) -> list[str]:
         try:
-            print(f"worker-comfyui - Connecting to websocket: {ws_url}")
-            async with websockets.connect(ws_url, open_timeout=10) as ws:
-                print(f"worker-comfyui - Websocket connected")
-                async for raw_message in ws:
-                    if not isinstance(raw_message, str):
-                        continue
+            response = await self.http.get("/object_info", timeout=self.timeout(read_s=10.0))
+            response.raise_for_status()
+            required = (
+                self._json(response)
+                .get("CheckpointLoaderSimple", {})
+                .get("input", {})
+                .get("required", {})
+            )
+            values = required.get("ckpt_name")
+            return values[0] if values and isinstance(values[0], list) else []
+        except Exception as exc:
+            self._log("Warning: Could not fetch available models: %s", exc)
+            return []
 
-                    try:
-                        message = json.loads(raw_message)
-                    except json.JSONDecodeError:
-                        print(f"worker-comfyui - Received invalid JSON message via websocket.")
-                        continue
+    async def _validation_error(self, response: httpx.Response) -> str:
+        raw = response.text
+        try:
+            data = self._json(response)
+        except Exception:
+            return f"ComfyUI validation failed (could not parse error response): {raw}"
+        error_value = data.get("error")
+        if isinstance(error_value, dict):
+            message = error_value.get("message") or "Workflow validation failed"
+            if error_value.get("type") == "prompt_outputs_failed_validation":
+                message = "Workflow validation failed"
+        else:
+            message = str(error_value or data.get("message") or "Workflow validation failed")
+        node_errors = []
+        for node_id, node_error in (data.get("node_errors") or {}).items():
+            if isinstance(node_error, dict):
+                node_errors.extend(f"Node {node_id} ({k}): {v}" for k, v in node_error.items())
+            else:
+                node_errors.append(f"Node {node_id}: {node_error}")
+        if data.get("type") == "prompt_outputs_failed_validation":
+            message = data.get("message") or "Workflow validation failed"
+        if node_errors:
+            message = f"{message}:\n" + "\n".join(f"• {detail}" for detail in node_errors)
+        elif raw and raw not in message:
+            message = f"{message}. Raw response: {raw}"
+        needs_models = data.get("type") == "prompt_outputs_failed_validation" or any(
+            "not in list" in detail and "ckpt_name" in detail for detail in node_errors
+        )
+        if not needs_models:
+            return message
+        checkpoints = await self._available_checkpoints()
+        hint = "\n\nThis usually means a required model or parameter is not available."
+        if checkpoints:
+            hint += f"\nAvailable checkpoint models: {', '.join(checkpoints)}"
+        else:
+            hint += "\nNo checkpoint models appear to be available. Please check your model installation."
+        return message + hint
 
-                    msg_type = message.get("type")
+    async def upload_images(self, images: list[ImageInput]) -> list[str]:
+        errors: list[str] = []
+        if not images:
+            return errors
+        self._log("Uploading %s image(s)...", len(images))
+        for image in images:
+            try:
+                raw = image.image.split(",", 1)[1] if "," in image.image else image.image
+                blob = base64.b64decode(raw.strip(), validate=True)
+                response = await self.http.post(
+                    "/upload/image",
+                    files={"image": (image.name, blob, "image/png"), "overwrite": (None, "true")},
+                    timeout=self.timeout(
+                        read_s=self.settings.upload_read_timeout_s,
+                        write_s=self.settings.upload_write_timeout_s,
+                    ),
+                )
+                response.raise_for_status()
+            except (binascii.Error, ValueError) as exc:
+                errors.append(f"Error decoding base64 for {image.name}: {exc}")
+            except httpx.TimeoutException:
+                errors.append(f"Timeout uploading {image.name}")
+            except httpx.RequestError as exc:
+                errors.append(f"Error uploading {image.name}: {exc}")
+            except Exception as exc:
+                errors.append(f"Unexpected error uploading {image.name}: {exc}")
+        for error in errors:
+            self._log(error)
+        if not errors:
+            self._log("image(s) upload complete")
+        return errors
 
-                    if msg_type == "executed":
-                        data = message.get("data", {})
-                        _record_ws_output(outputs, prompt_id, data)
+    async def queue_workflow(
+        self,
+        workflow: dict[str, Any],
+        client_id: str,
+        comfy_org_api_key: str | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {"prompt": workflow, "client_id": client_id}
+        effective_key = comfy_org_api_key or os.environ.get("COMFY_ORG_API_KEY")
+        if effective_key:
+            payload["extra_data"] = {"api_key_comfy_org": effective_key}
+        response = await self.http.post(
+            "/prompt",
+            content=_json_dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=self.timeout(
+                read_s=self.settings.prompt_read_timeout_s,
+                write_s=self.settings.prompt_write_timeout_s,
+            ),
+        )
+        if response.status_code == 400:
+            raise ValueError(await self._validation_error(response))
+        response.raise_for_status()
+        prompt_id = self._json(response).get("prompt_id")
+        if not prompt_id:
+            raise ValueError(f"Missing 'prompt_id' in queue response: {response.text}")
+        return prompt_id
 
-                    elif msg_type == "executing":
-                        data = message.get("data", {})
-                        if (
-                            data.get("node") is None
-                            and data.get("prompt_id") == prompt_id
-                        ):
-                            print(
-                                f"worker-comfyui - Execution finished for prompt {prompt_id}"
-                            )
-                            return MonitorResult(True, errors, outputs)
+    async def history(self, prompt_id: str) -> dict[str, Any]:
+        response = await self.http.get(
+            f"/history/{prompt_id}",
+            timeout=self.timeout(read_s=self.settings.history_read_timeout_s),
+        )
+        response.raise_for_status()
+        return self._json(response)
 
-                    elif msg_type == "execution_error":
-                        data = message.get("data", {})
-                        if data.get("prompt_id") == prompt_id:
-                            error_details = (
+    async def image_bytes(
+        self, filename: str, subfolder: str, image_type: str | None
+    ) -> bytes | None:
+        try:
+            response = await self.http.get(
+                "/view",
+                params={"filename": filename, "subfolder": subfolder, "type": image_type},
+                timeout=self.timeout(read_s=self.settings.output_read_timeout_s),
+            )
+            response.raise_for_status()
+            return response.content
+        except httpx.TimeoutException:
+            self._log("Timeout fetching image data for %s", filename)
+        except httpx.RequestError as exc:
+            self._log("Error fetching image data for %s: %s", filename, exc)
+        except Exception as exc:
+            self._log("Unexpected error fetching image data for %s: %s", filename, exc)
+        return None
+
+    async def watch_prompt(
+        self,
+        prompt_id: str,
+        client_id: str,
+        *,
+        emit_progress: bool,
+        reconnect: bool,
+    ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+        outputs: ImageManifest = {}
+        attempts = 0
+        while attempts <= self.settings.ws_reconnect_attempts:
+            try:
+                ws_url = f"{self.settings.ws_url}?clientId={client_id}"
+                self._log("Connecting to websocket: %s", ws_url)
+                async with websockets.connect(ws_url, open_timeout=10) as ws:
+                    self._log("Websocket connected")
+                    async for raw_message in ws:
+                        if not isinstance(raw_message, str):
+                            continue
+                        try:
+                            message = _json_loads(raw_message)
+                        except Exception:
+                            continue
+                        kind = message.get("type")
+                        data = message.get("data") or {}
+                        if kind == "progress" and emit_progress:
+                            yield "progress", {
+                                "step": data.get("value", 0),
+                                "total": data.get("max", 0),
+                            }
+                        elif kind == "executed":
+                            _record_ws_output(outputs, prompt_id, data)
+                        elif kind == "executing":
+                            if data.get("node") is None and data.get("prompt_id") == prompt_id:
+                                self._log("Execution finished for prompt %s", prompt_id)
+                                yield "complete", {"outputs": outputs}
+                                return
+                            if emit_progress and data.get("node"):
+                                yield "status", {"message": f"Executing node {data['node']}"}
+                        elif kind == "execution_error" and data.get("prompt_id") == prompt_id:
+                            details = (
                                 f"Node Type: {data.get('node_type')}, "
                                 f"Node ID: {data.get('node_id')}, "
                                 f"Message: {data.get('exception_message')}"
                             )
-                            print(
-                                f"worker-comfyui - Execution error received: {error_details}"
-                            )
-                            errors.append(f"Workflow execution error: {error_details}")
-                            return MonitorResult(False, errors, outputs)
-
-        except websockets.ConnectionClosed as closed_err:
-            reconnect_count += 1
-            print(
-                f"worker-comfyui - Websocket connection closed unexpectedly: {closed_err}. "
-                f"Attempting to reconnect ({reconnect_count}/{WEBSOCKET_RECONNECT_ATTEMPTS})..."
-            )
-
-            srv_status = await _comfy_server_status(http_client)
-            if not srv_status["reachable"]:
-                print(
-                    f"worker-comfyui - ComfyUI HTTP unreachable – aborting websocket reconnect: "
-                    f"{srv_status.get('error', 'status ' + str(srv_status.get('status_code')))}"
+                            yield "error", {"message": details, "outputs": outputs}
+                            return
+            except websockets.ConnectionClosed as exc:
+                if not reconnect:
+                    yield "error", {"message": f"WebSocket error: {exc}", "outputs": outputs}
+                    return
+                attempts += 1
+                self._log(
+                    "Websocket connection closed unexpectedly: %s. Attempting to reconnect (%s/%s)...",
+                    exc,
+                    attempts,
+                    self.settings.ws_reconnect_attempts,
                 )
-                raise ConnectionError("ComfyUI HTTP unreachable during websocket reconnect")
+                status = await self.server_status()
+                if not status["reachable"]:
+                    raise ConnectionError("ComfyUI HTTP unreachable during websocket reconnect")
+                await asyncio.sleep(self.settings.ws_reconnect_delay_s)
+            except Exception as exc:
+                if emit_progress:
+                    yield "error", {"message": f"WebSocket error: {exc}", "outputs": outputs}
+                    return
+                raise ConnectionError(f"WebSocket error: {exc}") from exc
+        raise ConnectionError(
+            f"Failed to reconnect websocket after {self.settings.ws_reconnect_attempts} attempts"
+        )
 
-            print(
-                f"worker-comfyui - ComfyUI HTTP reachable (status {srv_status.get('status_code')}), "
-                f"waiting {WEBSOCKET_RECONNECT_DELAY_S}s before retry..."
-            )
-            await asyncio.sleep(WEBSOCKET_RECONNECT_DELAY_S)
+    async def monitor_execution(self, prompt_id: str, client_id: str) -> ExecutionResult:
+        async for event_type, payload in self.watch_prompt(
+            prompt_id, client_id, emit_progress=False, reconnect=True
+        ):
+            if event_type == "complete":
+                return ExecutionResult(True, outputs=payload.get("outputs", {}))
+            if event_type == "error":
+                return ExecutionResult(
+                    False,
+                    [f"Workflow execution error: {payload['message']}"],
+                    payload.get("outputs", {}),
+                )
+        return ExecutionResult(False)
 
-        except Exception as e:
-            raise ConnectionError(f"WebSocket error: {e}")
-
-    raise ConnectionError(
-        f"Failed to reconnect websocket after {WEBSOCKET_RECONNECT_ATTEMPTS} attempts"
-    )
-
-
-async def _monitor_execution_streaming(prompt_id, client_id):
-    """
-    Async generator version of _monitor_execution.
-
-    Yields (event_type, data_dict) tuples for SSE streaming:
-      - ("progress", {"step": int, "total": int})
-      - ("status", {"message": str})
-      - ("error", {"message": str})
-      - ("_complete", {"outputs": dict[str, dict]})
-
-    Returns normally when execution completes.
-    """
-    ws_url = f"ws://{COMFY_HOST}/ws?clientId={client_id}"
-    outputs: dict[str, dict[str, Any]] = {}
-
-    try:
-        async with websockets.connect(ws_url, open_timeout=10) as ws:
-            async for raw_message in ws:
-                if not isinstance(raw_message, str):
-                    continue
-                try:
-                    message = json.loads(raw_message)
-                except json.JSONDecodeError:
-                    continue
-
-                msg_type = message.get("type")
-                data = message.get("data", {})
-
-                if msg_type == "progress":
-                    yield ("progress", {
-                        "step": data.get("value", 0),
-                        "total": data.get("max", 0),
-                    })
-                elif msg_type == "executed":
-                    _record_ws_output(outputs, prompt_id, data)
-                elif msg_type == "executing":
-                    if (
-                        data.get("node") is None
-                        and data.get("prompt_id") == prompt_id
-                    ):
-                        yield ("_complete", {"outputs": outputs})
-                        return  # execution finished
-                    elif data.get("node"):
-                        yield ("status", {
-                            "message": f"Executing node {data['node']}",
-                        })
-                elif msg_type == "execution_error":
-                    if data.get("prompt_id") == prompt_id:
-                        yield ("error", {
-                            "message": data.get("exception_message", "Execution error"),
-                        })
-                        return
-    except Exception as e:
-        yield ("error", {"message": f"WebSocket error: {e}"})
-
-
-async def _resolve_output_manifest(
-    http_client: httpx.AsyncClient,
-    prompt_id: str,
-    websocket_outputs: dict[str, dict[str, Any]],
-    request_id: str,
-    errors: list[str],
-    trace: RequestTrace | None = None,
-) -> dict[str, dict[str, Any]]:
-    with trace.measure("output_manifest") if trace is not None else nullcontext():
-        outputs = websocket_outputs
-        history_outputs: dict[str, Any] = {}
-
-        if _should_fetch_history(websocket_outputs, errors):
-            print(f"worker-comfyui - [{request_id}] Fetching history for prompt {prompt_id}...")
-            history = await get_history(http_client, prompt_id)
+    async def resolve_manifest(
+        self,
+        prompt_id: str,
+        websocket_outputs: ImageManifest,
+        request_id: str,
+        errors: list[str],
+        trace: RequestTrace | None = None,
+    ) -> ImageManifest:
+        with trace.measure("output_manifest") if trace is not None else nullcontext():
+            if not _manifest_needs_history(websocket_outputs, errors):
+                return websocket_outputs
+            self._request_log(request_id, "Fetching history for prompt %s...", prompt_id)
+            history = await self.history(prompt_id)
             if prompt_id not in history:
                 raise KeyError(prompt_id)
-            history_outputs = history.get(prompt_id, {}).get("outputs", {})
+            outputs = history.get(prompt_id, {}).get("outputs", {})
+            return _merge_outputs(websocket_outputs, outputs) if outputs else websocket_outputs
 
-        if history_outputs:
-            outputs = _merge_output_manifests(websocket_outputs, history_outputs)
+    async def collect_images(
+        self,
+        outputs: dict[str, Any],
+        request_id: str,
+        trace: RequestTrace | None = None,
+        errors: list[str] | None = None,
+    ) -> list[dict[str, str]]:
+        specs: list[tuple[str, str, str, str | None]] = []
+        for node_id, node_output in outputs.items():
+            for image in node_output.get("images", []):
+                if image.get("type") == "temp":
+                    continue
+                if not image.get("filename"):
+                    message = f"Skipping image in node {node_id} due to missing filename: {image}"
+                    self._request_log(request_id, message)
+                    if errors is not None:
+                        errors.append(message)
+                    continue
+                specs.append(
+                    (
+                        image["filename"],
+                        image.get("subfolder", ""),
+                        image.get("type"),
+                        str(node_id),
+                    )
+                )
+            other_keys = [key for key in node_output if key != "images"]
+            if other_keys:
+                self._request_log(
+                    request_id,
+                    "WARNING: Node %s produced unhandled output keys: %s.",
+                    node_id,
+                    other_keys,
+                )
+        if not specs:
+            return []
+        semaphore = asyncio.Semaphore(self.settings.output_fetch_concurrency)
 
-        return outputs
+        async def fetch(
+            spec: tuple[str, str, str | None, str]
+        ) -> tuple[dict[str, str] | None, str | None]:
+            filename, subfolder, image_type, _ = spec
+            async with semaphore:
+                fetch_started_ns = time.perf_counter_ns()
+                image_bytes = await self.image_bytes(filename, subfolder, image_type)
+            if trace is not None:
+                trace.add_ns("image_fetch", time.perf_counter_ns() - fetch_started_ns)
+            if not image_bytes:
+                return None, f"Failed to fetch image data for {filename} from /view endpoint."
+            try:
+                encode_started_ns = time.perf_counter_ns()
+                data = base64.b64encode(image_bytes).decode("ascii")
+                if trace is not None:
+                    trace.add_ns("base64_encode", time.perf_counter_ns() - encode_started_ns)
+                return {"filename": filename, "type": "base64", "data": data}, None
+            except Exception as exc:
+                return None, f"Error encoding {filename} to base64: {exc}"
 
+        results = await asyncio.gather(*(fetch(spec) for spec in specs))
+        images: list[dict[str, str]] = []
+        for image, error in results:
+            if image:
+                images.append(image)
+            elif errors is not None and error:
+                self._request_log(request_id, error)
+                errors.append(error)
+        return images
 
-def _build_json_http_response(
-    status_code: int,
-    payload: dict[str, Any],
-    trace: RequestTrace,
-    *,
-    error: str | None = None,
-) -> Response:
-    with trace.measure("response_serialize"):
-        body = _serialize_json_bytes(payload)
-    trace.response_bytes = len(body)
-    trace.mark_total()
-    headers = _trace_headers(trace)
-    _log_request_summary(trace, status_code, error=error)
-    return Response(
-        content=body,
-        media_type="application/json",
-        status_code=status_code,
-        headers=headers,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Core workflow processing (async)
-# ---------------------------------------------------------------------------
-
-async def process_workflow(
-    http_client: httpx.AsyncClient,
-    request_data: GenerateRequest,
-    request_id: str,
-    trace: RequestTrace,
-) -> dict[str, Any]:
-    """Process a ComfyUI workflow from start to finish."""
-    workflow = request_data.workflow
-    input_images = request_data.images
-    comfy_org_api_key = request_data.comfy_org_api_key
-
-    # Upload input images if provided
-    if input_images:
-        images_dicts = [img.model_dump() for img in input_images]
-        with trace.measure("upload"):
-            upload_result = await upload_images(http_client, images_dicts)
-        if upload_result["status"] == "error":
-            return {
-                "error": "Failed to upload one or more input images",
-                "details": upload_result["details"],
-            }
-
-    # Generate a unique client_id for this request's WebSocket session
-    client_id = str(uuid.uuid4())
-
-    # Queue the workflow on ComfyUI
-    try:
-        with trace.measure("queue"):
-            queued_workflow = await queue_workflow(
-                http_client, workflow, client_id, comfy_org_api_key
-            )
-        prompt_id = queued_workflow.get("prompt_id")
-        if not prompt_id:
-            raise ValueError(
-                f"Missing 'prompt_id' in queue response: {queued_workflow}"
-            )
-        print(f"worker-comfyui - [{request_id}] Queued workflow with ID: {prompt_id}")
-    except httpx.RequestError as e:
-        print(f"worker-comfyui - [{request_id}] Error queuing workflow: {e}")
-        return {"error": f"Error queuing workflow: {e}"}
-    except ValueError as e:
-        print(f"worker-comfyui - [{request_id}] Workflow validation error: {e}")
-        return {"error": str(e)}
-
-    # Monitor execution via WebSocket
-    try:
-        with trace.measure("websocket_wait"):
-            monitor_result = await _monitor_execution(http_client, prompt_id, client_id)
-    except (ConnectionError, Exception) as e:
-        print(f"worker-comfyui - [{request_id}] WebSocket error: {e}")
-        print(traceback.format_exc())
-        return {"error": f"WebSocket communication error: {e}"}
-
-    execution_done = monitor_result.execution_done
-    errors = monitor_result.errors
-
-    if not execution_done and not errors:
-        return {
-            "error": "Workflow monitoring loop exited without confirmation of completion or error."
-        }
-
-    try:
-        history_fallback_used = _should_fetch_history(monitor_result.outputs, errors)
-        outputs = await _resolve_output_manifest(
-            http_client,
-            prompt_id,
-            monitor_result.outputs,
-            request_id,
-            errors,
-            trace=trace,
-        )
-        if history_fallback_used:
-            trace.output_source = (
-                "websocket+history"
-                if _manifest_has_usable_images(monitor_result.outputs)
-                else "history"
-            )
-        else:
-            trace.output_source = "websocket"
-    except KeyError:
-        error_msg = f"Prompt ID {prompt_id} not found in history after execution."
-        print(f"worker-comfyui - [{request_id}] {error_msg}")
-        if not errors:
-            return {"error": error_msg}
-        errors.append(error_msg)
-        return {
-            "error": "Job processing failed, prompt ID not found in history.",
-            "details": errors,
-        }
-    except Exception as e:
-        return {"error": f"Failed to fetch history: {e}"}
-
-    if not outputs:
-        warning_msg = f"No outputs found in history for prompt {prompt_id}."
-        print(f"worker-comfyui - [{request_id}] {warning_msg}")
-        if not errors:
-            errors.append(warning_msg)
-
-    # Process output images
-    output_data = await _collect_output_images(
-        http_client, outputs, request_id, trace=trace, errors=errors
-    )
-
-    # Build final result
-    final_result = {}
-
-    if output_data:
-        final_result["images"] = output_data
-
-    if errors:
-        final_result["errors"] = errors
-        print(f"worker-comfyui - [{request_id}] Job completed with errors/warnings: {errors}")
-
-    if not output_data and errors:
-        print(f"worker-comfyui - [{request_id}] Job failed with no output images.")
-        return {
-            "error": "Job processing failed",
-            "details": errors,
-        }
-    elif not output_data and not errors:
-        print(
-            f"worker-comfyui - [{request_id}] Job completed successfully, but the workflow produced no images."
-        )
-        final_result["status"] = "success_no_images"
-        final_result["images"] = []
-
-    print(
-        f"worker-comfyui - [{request_id}] Job completed. Returning {len(output_data)} image(s) via {trace.output_source}."
-    )
-    return final_result
-
-
-# ---------------------------------------------------------------------------
-# Startup: wait for ComfyUI to become ready
-# ---------------------------------------------------------------------------
-
-async def _wait_for_comfyui(app_instance):
-    """
-    Background task that polls ComfyUI until it responds with HTTP 200.
-    Sets app.state.comfyui_ready = True once ready.
-    """
-    url = f"http://{COMFY_HOST}/"
-    delay = max(1, COMFY_API_AVAILABLE_INTERVAL_MS) / 1000  # convert ms to seconds
-    log_every = max(1, int(10_000 / max(1, COMFY_API_AVAILABLE_INTERVAL_MS)))
-    attempt = 0
-
-    print(f"worker-comfyui - Checking API server at {url}...")
-    http_client: httpx.AsyncClient = app_instance.state.http_client
-
-    while True:
-        process_status = _is_comfyui_process_alive()
-        if process_status is False:
-            print(
-                "worker-comfyui - ComfyUI process has exited. "
-                "Server will not become reachable."
-            )
-            return  # stay unhealthy
-
+    async def process(
+        self, request: GenerateRequest, request_id: str, trace: RequestTrace
+    ) -> dict[str, Any]:
+        if request.images:
+            with trace.measure("upload"):
+                upload_errors = await self.upload_images(request.images)
+            if upload_errors:
+                return {
+                    "error": "Failed to upload one or more input images",
+                    "details": upload_errors,
+                }
+        client_id = str(uuid.uuid4())
         try:
-            resp = await http_client.get(
-                "/", timeout=_http_timeout(read_s=COMFY_HTTP_STATUS_READ_TIMEOUT_S)
+            with trace.measure("queue"):
+                prompt_id = await self.queue_workflow(
+                    request.workflow, client_id, request.comfy_org_api_key
+                )
+            self._request_log(request_id, "Queued workflow with ID: %s", prompt_id)
+        except httpx.RequestError as exc:
+            self._request_log(request_id, "Error queuing workflow: %s", exc)
+            return {"error": f"Error queuing workflow: {exc}"}
+        except ValueError as exc:
+            self._request_log(request_id, "Workflow validation error: %s", exc)
+            return {"error": str(exc)}
+        try:
+            with trace.measure("websocket_wait"):
+                execution = await self.monitor_execution(prompt_id, client_id)
+        except Exception as exc:
+            logger.exception("worker-comfyui - [%s] WebSocket error: %s", request_id, exc)
+            return {"error": f"WebSocket communication error: {exc}"}
+        if not execution.done and not execution.errors:
+            return {
+                "error": "Workflow monitoring loop exited without confirmation of completion or error."
+            }
+        try:
+            needs_history = _manifest_needs_history(execution.outputs, execution.errors)
+            outputs = await self.resolve_manifest(
+                prompt_id, execution.outputs, request_id, execution.errors, trace
             )
-            if resp.status_code == 200:
-                print(f"worker-comfyui - API is reachable")
-                app_instance.state.comfyui_ready = True
-                return
-        except httpx.TimeoutException:
-            pass
-        except httpx.RequestError:
-            pass
-
-        attempt += 1
-
-        fallback = (
-            COMFY_API_AVAILABLE_MAX_RETRIES
-            if COMFY_API_AVAILABLE_MAX_RETRIES > 0
-            else COMFY_API_FALLBACK_MAX_RETRIES
+            trace.output_source = (
+                "websocket"
+                if not needs_history
+                else "websocket+history" if _manifest_has_images(execution.outputs) else "history"
+            )
+        except KeyError:
+            message = f"Prompt ID {prompt_id} not found in history after execution."
+            self._request_log(request_id, message)
+            if not execution.errors:
+                return {"error": message}
+            execution.errors.append(message)
+            return {
+                "error": "Job processing failed, prompt ID not found in history.",
+                "details": execution.errors,
+            }
+        except Exception as exc:
+            return {"error": f"Failed to fetch history: {exc}"}
+        if not outputs:
+            message = f"No outputs found in history for prompt {prompt_id}."
+            self._request_log(request_id, message)
+            if not execution.errors:
+                execution.errors.append(message)
+        images = await self.collect_images(outputs, request_id, trace, execution.errors)
+        if images:
+            result: dict[str, Any] = {"images": images}
+        elif execution.errors:
+            self._request_log(request_id, "Job failed with no output images.")
+            return {"error": "Job processing failed", "details": execution.errors}
+        else:
+            self._request_log(
+                request_id,
+                "Job completed successfully, but the workflow produced no images.",
+            )
+            result = {"status": "success_no_images", "images": []}
+        if execution.errors:
+            result["errors"] = execution.errors
+            self._request_log(
+                request_id, "Job completed with errors/warnings: %s", execution.errors
+            )
+        self._request_log(
+            request_id,
+            "Job completed. Returning %s image(s) via %s.",
+            len(result["images"]),
+            trace.output_source,
         )
-        if process_status is None and attempt >= fallback:
-            print(
-                f"worker-comfyui - Failed to connect to server at {url} "
-                f"after {fallback} attempts (no PID file found)."
+        return result
+
+    async def stream(self, request: GenerateRequest, request_id: str) -> AsyncIterator[str]:
+        def sse(event: str, payload: dict[str, Any]) -> str:
+            data = _json_dumps(payload).decode("utf-8", errors="replace")
+            return f"event: {event}\ndata: {data}\n\n"
+
+        if request.images:
+            yield sse("status", {"message": "Uploading input images..."})
+            errors = await self.upload_images(request.images)
+            if errors:
+                yield sse("error", {"message": "Failed to upload input images"})
+                return
+        yield sse("status", {"message": "Queuing workflow..."})
+        client_id = str(uuid.uuid4())
+        try:
+            prompt_id = await self.queue_workflow(
+                request.workflow, client_id, request.comfy_org_api_key
             )
-            return  # stay unhealthy
-
-        if attempt % log_every == 0:
-            elapsed_s = attempt * delay
-            print(
-                f"worker-comfyui - Still waiting for API server... "
-                f"({elapsed_s:.0f}s elapsed, attempt {attempt})"
+            self._request_log(request_id, "Queued workflow with ID: %s", prompt_id)
+        except (httpx.RequestError, ValueError) as exc:
+            yield sse("error", {"message": str(exc)})
+            return
+        yield sse("status", {"message": "Processing..."})
+        websocket_outputs: ImageManifest = {}
+        async for event_type, payload in self.watch_prompt(
+            prompt_id, client_id, emit_progress=True, reconnect=False
+        ):
+            if event_type == "complete":
+                websocket_outputs = payload.get("outputs", {})
+                break
+            if event_type == "error":
+                yield sse("error", {"message": payload["message"]})
+                return
+            yield sse(event_type, payload)
+        yield sse("status", {"message": "Fetching results..."})
+        try:
+            outputs = await self.resolve_manifest(
+                prompt_id, websocket_outputs, request_id, [], None
             )
+        except KeyError:
+            yield sse("error", {"message": "Prompt not found in history"})
+            return
+        except Exception as exc:
+            yield sse("error", {"message": f"Failed to fetch history: {exc}"})
+            return
+        images = await self.collect_images(outputs, request_id)
+        self._request_log(request_id, "Streaming complete. %s image(s).", len(images))
+        yield sse("result", {"images": images})
 
-        await asyncio.sleep(delay)
 
+worker = ComfyWorker(SETTINGS)
 
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app_instance: FastAPI):
-    """Manage application startup and shutdown."""
-    app_instance.state.comfyui_ready = False
-    app_instance.state.http_client = _build_http_client()
-    startup_task = asyncio.create_task(_wait_for_comfyui(app_instance))
+    startup_task = asyncio.create_task(worker.wait_until_ready())
+    app_instance.state.worker = worker
     try:
         yield
     finally:
@@ -1109,7 +839,7 @@ async def lifespan(app_instance: FastAPI):
             await startup_task
         except asyncio.CancelledError:
             pass
-        await app_instance.state.http_client.aclose()
+        await worker.close()
 
 
 app = FastAPI(title="ComfyUI Load Balancing Worker", lifespan=lifespan)
@@ -1117,170 +847,53 @@ app = FastAPI(title="ComfyUI Load Balancing Worker", lifespan=lifespan)
 
 @app.get("/ping")
 async def ping():
-    """Health check endpoint required by RunPod load balancer."""
-    if not app.state.comfyui_ready:
-        return Response(status_code=204)  # 204 = initializing
-    return Response(status_code=200, content="OK")
+    return Response(status_code=200, content="OK") if worker.ready else Response(status_code=204)
 
 
 @app.post("/generate")
 async def generate(request: GenerateRequest):
-    """Submit a ComfyUI workflow and receive output images."""
-    request_id = str(uuid.uuid4())
-    trace = RequestTrace(request_id)
-
-    if not app.state.comfyui_ready:
+    trace = RequestTrace(str(uuid.uuid4()))
+    if not worker.ready:
         payload = {"error": "ComfyUI is not ready yet"}
-        return _build_json_http_response(
-            status_code=503,
-            payload=payload,
-            trace=trace,
-            error=payload["error"],
-        )
-
-    print(f"worker-comfyui - [{request_id}] Received generate request")
+        return _response_json(payload, 503, trace, error=payload["error"])
+    ComfyWorker._request_log(trace.request_id, "Received generate request")
     trace.stage_ns["receive"] = time.perf_counter_ns() - trace.started_ns
-
     try:
         result = await asyncio.wait_for(
-            process_workflow(app.state.http_client, request, request_id, trace),
-            timeout=PROCESSING_TIMEOUT_S,
+            worker.process(request, trace.request_id, trace),
+            timeout=SETTINGS.processing_timeout_s,
         )
     except asyncio.TimeoutError:
-        print(f"worker-comfyui - [{request_id}] Processing timed out after {PROCESSING_TIMEOUT_S}s")
-        payload = {"error": f"Workflow processing timed out after {PROCESSING_TIMEOUT_S}s"}
-        return _build_json_http_response(
-            status_code=504,
-            payload=payload,
-            trace=trace,
-            error=payload["error"],
+        payload = {"error": f"Workflow processing timed out after {SETTINGS.processing_timeout_s}s"}
+        ComfyWorker._request_log(
+            trace.request_id, "Processing timed out after %ss", SETTINGS.processing_timeout_s
         )
-    except Exception as e:
-        print(f"worker-comfyui - [{request_id}] Unexpected error: {e}")
-        print(traceback.format_exc())
-        payload = {"error": f"An unexpected error occurred: {e}"}
-        return _build_json_http_response(
-            status_code=500,
-            payload=payload,
-            trace=trace,
-            error=payload["error"],
-        )
-
+        return _response_json(payload, 504, trace, error=payload["error"])
+    except Exception as exc:
+        logger.exception("worker-comfyui - [%s] Unexpected error: %s", trace.request_id, exc)
+        payload = {"error": f"An unexpected error occurred: {exc}"}
+        return _response_json(payload, 500, trace, error=payload["error"])
     if "error" in result:
         status_code = 422 if "validation" in result.get("error", "").lower() else 500
-        return _build_json_http_response(
-            status_code=status_code,
-            payload=result,
-            trace=trace,
-            error=result.get("error"),
-        )
-
-    return _build_json_http_response(status_code=200, payload=result, trace=trace)
-
-
-# ---------------------------------------------------------------------------
-# SSE streaming endpoint
-# ---------------------------------------------------------------------------
-
-async def _stream_workflow(
-    http_client: httpx.AsyncClient, request_data: GenerateRequest, request_id: str
-):
-    """Async generator that yields SSE-formatted strings with progress events."""
-
-    def sse(event, data):
-        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
-
-    workflow = request_data.workflow
-    input_images = request_data.images
-    comfy_org_api_key = request_data.comfy_org_api_key
-
-    # Upload input images if provided
-    if input_images:
-        yield sse("status", {"message": "Uploading input images..."})
-        images_dicts = [img.model_dump() for img in input_images]
-        upload_result = await upload_images(http_client, images_dicts)
-        if upload_result["status"] == "error":
-            yield sse("error", {"message": "Failed to upload input images"})
-            return
-
-    # Queue the workflow
-    yield sse("status", {"message": "Queuing workflow..."})
-    client_id = str(uuid.uuid4())
-
-    try:
-        queued = await queue_workflow(
-            http_client, workflow, client_id, comfy_org_api_key
-        )
-        prompt_id = queued.get("prompt_id")
-        if not prompt_id:
-            yield sse("error", {"message": "Missing prompt_id in queue response"})
-            return
-        print(f"worker-comfyui - [{request_id}] Queued workflow with ID: {prompt_id}")
-    except (httpx.RequestError, ValueError) as e:
-        yield sse("error", {"message": str(e)})
-        return
-
-    # Monitor execution, forwarding progress events
-    yield sse("status", {"message": "Processing..."})
-    websocket_outputs: dict[str, dict[str, Any]] = {}
-
-    async for event_type, event_data in _monitor_execution_streaming(prompt_id, client_id):
-        if event_type == "_complete":
-            websocket_outputs = event_data.get("outputs", {})
-            continue
-        yield sse(event_type, event_data)
-        if event_type == "error":
-            return
-
-    # Fetch results
-    yield sse("status", {"message": "Fetching results..."})
-
-    try:
-        outputs = await _resolve_output_manifest(
-            http_client,
-            prompt_id,
-            websocket_outputs,
-            request_id,
-            [],
-        )
-    except KeyError:
-        yield sse("error", {"message": "Prompt not found in history"})
-        return
-    except Exception as e:
-        yield sse("error", {"message": f"Failed to fetch history: {e}"})
-        return
-    output_data = await _collect_output_images(http_client, outputs, request_id)
-
-    result = {"images": output_data}
-    print(f"worker-comfyui - [{request_id}] Streaming complete. {len(output_data)} image(s).")
-    yield sse("result", result)
+        return _response_json(result, status_code, trace, error=result.get("error"))
+    return _response_json(result, 200, trace)
 
 
 @app.post("/generate-stream")
 async def generate_stream(request: GenerateRequest):
-    """Submit a ComfyUI workflow and receive SSE progress events + output images."""
-    if not app.state.comfyui_ready:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "ComfyUI is not ready yet"},
-        )
-
+    if not worker.ready:
+        return _response_json({"error": "ComfyUI is not ready yet"}, 503)
     request_id = str(uuid.uuid4())
-    print(f"worker-comfyui - [{request_id}] Received streaming generate request")
-
+    ComfyWorker._request_log(request_id, "Received streaming generate request")
     return StreamingResponse(
-        _stream_workflow(app.state.http_client, request, request_id),
+        worker.stream(request, request_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
-# ---------------------------------------------------------------------------
-# Entry point (for direct execution / uvicorn)
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import uvicorn
 
-    print(f"worker-comfyui - Starting FastAPI server on port {PORT}")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    logger.info("worker-comfyui - Starting FastAPI server on port %s", SETTINGS.port)
+    uvicorn.run(app, host="0.0.0.0", port=SETTINGS.port)
