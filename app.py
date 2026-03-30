@@ -649,10 +649,115 @@ async def process_workflow(request_data, request_id):
 # Startup: wait for ComfyUI to become ready
 # ---------------------------------------------------------------------------
 
+def _build_prewarm_workflow():
+    """Build a minimal 64x64, 1-step workflow to force-load all models into VRAM."""
+    return {
+        "9": {
+            "inputs": {"filename_prefix": "prewarm", "images": ["65", 0]},
+            "class_type": "SaveImage",
+        },
+        "62": {
+            "inputs": {
+                "clip_name": "qwen_3_4b.safetensors",
+                "type": "lumina2",
+                "device": "default",
+            },
+            "class_type": "CLIPLoader",
+        },
+        "63": {
+            "inputs": {"vae_name": "ae.safetensors"},
+            "class_type": "VAELoader",
+        },
+        "64": {
+            "inputs": {"conditioning": ["67", 0]},
+            "class_type": "ConditioningZeroOut",
+        },
+        "65": {
+            "inputs": {"samples": ["70", 0], "vae": ["63", 0]},
+            "class_type": "VAEDecode",
+        },
+        "67": {
+            "inputs": {"text": "warmup", "clip": ["62", 0]},
+            "class_type": "CLIPTextEncode",
+        },
+        "68": {
+            "inputs": {"width": 64, "height": 64, "batch_size": 1},
+            "class_type": "EmptySD3LatentImage",
+        },
+        "69": {
+            "inputs": {"shift": 3, "model": ["74", 0]},
+            "class_type": "ModelSamplingAuraFlow",
+        },
+        "70": {
+            "inputs": {
+                "seed": 42,
+                "steps": 1,
+                "cfg": 1,
+                "sampler_name": "res_multistep",
+                "scheduler": "simple",
+                "denoise": 1,
+                "model": ["69", 0],
+                "positive": ["67", 0],
+                "negative": ["64", 0],
+                "latent_image": ["68", 0],
+            },
+            "class_type": "KSampler",
+        },
+        "74": {
+            "inputs": {
+                "model_name": "z_image_turbo_bf16.safetensors",
+                "weight_dtype": "bf16",
+                "compute_dtype": "fp16",
+                "patch_cublaslinear": True,
+                "sage_attention": "sageattn_qk_int8_pv_fp8_cuda++",
+                "enable_fp16_accumulation": True,
+            },
+            "class_type": "DiffusionModelLoaderKJ",
+        },
+    }
+
+
+async def _prewarm_models():
+    """Run a tiny dummy workflow to force all models into VRAM."""
+    import time
+
+    t0 = time.monotonic()
+    print("worker-comfyui - Pre-warming models (64x64, 1 step)...")
+
+    workflow = _build_prewarm_workflow()
+    client_id = str(uuid.uuid4())
+
+    try:
+        queued = await asyncio.to_thread(queue_workflow, workflow, client_id)
+        prompt_id = queued.get("prompt_id")
+        if not prompt_id:
+            print("worker-comfyui - Pre-warm: missing prompt_id, skipping")
+            return False
+
+        execution_done, errors = await _monitor_execution(prompt_id, client_id)
+
+        elapsed = time.monotonic() - t0
+        if execution_done:
+            print(f"worker-comfyui - Pre-warm complete in {elapsed:.1f}s — models are hot")
+            return True
+        else:
+            print(f"worker-comfyui - Pre-warm finished with errors after {elapsed:.1f}s: {errors}")
+            return False
+
+    except Exception as e:
+        elapsed = time.monotonic() - t0
+        print(f"worker-comfyui - Pre-warm failed after {elapsed:.1f}s: {e}")
+        return False
+
+
+# Whether to pre-warm models at startup (disable with PREWARM_MODELS=0)
+PREWARM_MODELS = os.environ.get("PREWARM_MODELS", "1") != "0"
+
+
 async def _wait_for_comfyui(app_instance):
     """
-    Background task that polls ComfyUI until it responds with HTTP 200.
-    Sets app.state.comfyui_ready = True once ready.
+    Background task that polls ComfyUI until it responds with HTTP 200,
+    optionally pre-warms models, then sets app.state.comfyui_ready = True.
     """
     url = f"http://{COMFY_HOST}/"
     delay = max(1, COMFY_API_AVAILABLE_INTERVAL_MS) / 1000  # convert ms to seconds
@@ -674,8 +779,7 @@ async def _wait_for_comfyui(app_instance):
             resp = requests.get(url, timeout=5)
             if resp.status_code == 200:
                 print(f"worker-comfyui - API is reachable")
-                app_instance.state.comfyui_ready = True
-                return
+                break
         except requests.Timeout:
             pass
         except requests.RequestException:
@@ -703,6 +807,14 @@ async def _wait_for_comfyui(app_instance):
             )
 
         await asyncio.sleep(delay)
+
+    # Pre-warm models so first real request hits hot VRAM
+    if PREWARM_MODELS:
+        await _prewarm_models()
+    else:
+        print("worker-comfyui - Model pre-warming disabled (PREWARM_MODELS=0)")
+
+    app_instance.state.comfyui_ready = True
 
 
 # ---------------------------------------------------------------------------
