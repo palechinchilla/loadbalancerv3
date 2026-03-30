@@ -124,7 +124,7 @@ RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes
 
 
 # Install Python runtime dependencies for the handler
-RUN uv pip install fastapi "uvicorn[standard]" requests websockets pydantic tqdm
+RUN uv pip install fastapi "uvicorn[standard]" httpx orjson websockets pydantic tqdm
 
 # Add application code and scripts
 ADD src/start.sh app.py ./
