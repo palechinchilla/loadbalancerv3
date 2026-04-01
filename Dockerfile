@@ -41,7 +41,9 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender1 \
     ffmpeg \
+    openssh-server \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/pip3 /usr/bin/pip \
     && apt-get autoremove -y \
     && apt-get clean -y \
@@ -100,19 +102,12 @@ RUN wget -q -O /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl \
     uv pip install --no-cache-dir /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl && \
     rm /tmp/sageattention-2.2.0-cp312-cp312-linux_x86_64.whl
 
-# Reinstall ComfyUI's own requirements (alembic, comfy_aimdo, etc. may have
-# been lost during the PyTorch uninstall/reinstall cycle above)
-RUN uv pip install --no-cache-dir -r /comfyui/requirements.txt
+# Change working directory to ComfyUI
+WORKDIR /comfyui
 
-# Re-pin PyTorch cu130 in case ComfyUI requirements overwrote it
-RUN uv pip install --no-cache-dir \
-    torch==2.10.0+cu130 \
-    torchvision==0.25.0+cu130 \
-    torchaudio==2.10.0+cu130 \
-    --index-url https://download.pytorch.org/whl/cu130
 
-# Extra model paths for cached/snapshot models
-COPY src/extra_model_paths.yaml /comfyui/extra_model_paths.yaml
+# Support for the network volume
+ADD src/extra_model_paths.yaml ./
 
 # Go back to the root
 WORKDIR /
@@ -122,13 +117,29 @@ RUN git clone https://github.com/kijai/ComfyUI-KJNodes.git /comfyui/custom_nodes
     && cd /comfyui/custom_nodes/ComfyUI-KJNodes \
     && if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
 
+# Install custom nodes - KJNodes (SageAttention wrapper)
+RUN git clone https://github.com/Jasonzzt/ComfyUI-CacheDiT.git /comfyui/custom_nodes/ComfyUI-CacheDiT \
+    && cd /comfyui/custom_nodes/ComfyUI-CacheDiT \
+    && if [ -f requirements.txt ]; then uv pip install -r requirements.txt; fi
 
-# Install Python runtime dependencies for the handler
-RUN uv pip install fastapi "uvicorn[standard]" httpx orjson websockets pydantic tqdm
+# Re-sync ComfyUI's own runtime dependencies after the custom Torch/Triton stack.
+# This protects us from upstream ComfyUI changes on newer tags, including the
+# sqlite migration dependencies and comfy-aimdo startup import.
+RUN uv pip install --no-cache-dir -r /comfyui/requirements.txt \
+    && uv pip install --no-cache-dir comfy-aimdo alembic SQLAlchemy
 
-# Add application code and scripts
-ADD src/start.sh app.py ./
-RUN chmod +x /start.sh
+
+
+
+
+
+# Install Python runtime dependencies for the load balancer worker
+COPY requirements.txt /requirements.txt
+RUN uv pip install -r /requirements.txt
+
+# Add application code
+COPY src /src
+RUN chmod +x /src/start.sh
 
 # Add script to install custom nodes
 COPY scripts/comfy-node-install.sh /usr/local/bin/comfy-node-install
@@ -141,5 +152,18 @@ ENV PIP_NO_INPUT=1
 COPY scripts/comfy-manager-set-mode.sh /usr/local/bin/comfy-manager-set-mode
 RUN chmod +x /usr/local/bin/comfy-manager-set-mode
 
+ENV PYTHONPATH="/"
+
 # Set the default command to run when starting the container
-CMD ["/start.sh"]
+CMD ["/src/start.sh"]
+
+# Change working directory to ComfyUI
+WORKDIR /comfyui
+
+# Create necessary directories upfront
+RUN mkdir -p models/checkpoints models/vae models/unet models/clip models/text_encoders models/diffusion_models models/model_patches models/loras
+
+WORKDIR /
+
+EXPOSE 80
+EXPOSE 8080
